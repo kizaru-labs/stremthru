@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/MunifTanjim/stremthru/core"
 	"github.com/MunifTanjim/stremthru/store"
@@ -117,7 +118,7 @@ func TestCheckMagnetMapsDetailedResponse(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":{"items":[{
 			"torrentId":"99999999-9999-9999-9999-999999999999",
 			"hash":"` + cachedHash + `",
-			"status":"cached",
+			"status":"ready",
 			"name":"Some.Movie.2024.1080p",
 			"totalSize":100,
 			"files":[{"id":"11111111-1111-1111-1111-111111111111","path":"Some.Movie.2024.1080p/movie.mkv","name":"movie.mkv","size":90}]
@@ -317,14 +318,18 @@ func TestCanonicalPathMatchesStremThruConvention(t *testing.T) {
 
 func TestMagnetStatusMapping(t *testing.T) {
 	cases := map[string]store.MagnetStatus{
+		"ready":        store.MagnetStatusCached,
 		"cached":       store.MagnetStatusCached,
 		"uploaded":     store.MagnetStatusCached,
 		"seeding":      store.MagnetStatusCached,
 		"downloading":  store.MagnetStatusDownloading,
 		"meta_pending": store.MagnetStatusDownloading,
 		"stalled":      store.MagnetStatusDownloading,
+		"preparing":    store.MagnetStatusUploading,
 		"uploading":    store.MagnetStatusUploading,
+		"failed":       store.MagnetStatusFailed,
 		"error":        store.MagnetStatusFailed,
+		"queued":       store.MagnetStatusQueued,
 		"":             store.MagnetStatusQueued,
 		"mystery":      store.MagnetStatusQueued,
 	}
@@ -356,7 +361,7 @@ func TestAddMagnetReturnsPlayableFiles(t *testing.T) {
 				t.Errorf("Content-Type = %q, want form encoding", got)
 			}
 			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"data":{"message":"Torrent registered successfully","torrent":{"id":"t1","userTorrentId":"ut1","infoHash":"abc","name":"Show.S01","totalSize":50,"status":"cached"}}}`))
+			_, _ = w.Write([]byte(`{"data":{"message":"Torrent registered successfully","torrent":{"id":"t1","userTorrentId":"ut1","infoHash":"abc","name":"Show.S01","totalSize":50,"status":"ready"}}}`))
 		case http.MethodGet:
 			if r.URL.Path != "/api/v1/torrents/item" {
 				t.Errorf("path = %q, want the item endpoint", r.URL.Path)
@@ -364,7 +369,7 @@ func TestAddMagnetReturnsPlayableFiles(t *testing.T) {
 			if got := r.URL.Query().Get("torrentId"); got != "t1" {
 				t.Errorf("torrentId = %q, want t1", got)
 			}
-			_, _ = w.Write([]byte(`{"data":{"torrent":{"id":"t1","userTorrentId":"ut1","infoHash":"abc","name":"Show.S01","totalSize":50,"status":"cached"},"files":[{"id":"33333333-3333-3333-3333-333333333333","path":"Show.S01/e01.mkv","size":50}]}}`))
+			_, _ = w.Write([]byte(`{"data":{"torrent":{"id":"t1","userTorrentId":"ut1","infoHash":"abc","name":"Show.S01","totalSize":50,"status":"ready"},"files":[{"id":"33333333-3333-3333-3333-333333333333","path":"Show.S01/e01.mkv","size":50}]}}`))
 		}
 	})
 
@@ -392,12 +397,12 @@ func TestAddMagnetReturnsPlayableFiles(t *testing.T) {
 func TestPlayableFilesRequiresReadyTorrent(t *testing.T) {
 	files := []TorrentFile{{ID: "44444444-4444-4444-4444-444444444444", Path: "Show.S01/e01.mkv", Size: 10}}
 
-	for _, waiting := range []string{"meta_pending", "downloading", "uploading", "error", ""} {
+	for _, waiting := range []string{"queued", "preparing", "failed", "meta_pending", "downloading", "uploading", "error", ""} {
 		if got := playableFiles("t1", waiting, files); len(got) != 0 {
 			t.Errorf("%q: got %d files, want 0", waiting, len(got))
 		}
 	}
-	for _, ready := range []string{"cached", "uploaded", "seeding"} {
+	for _, ready := range []string{"ready", "cached", "uploaded", "seeding"} {
 		if got := playableFiles("t1", ready, files); len(got) != 1 {
 			t.Errorf("%q: got %d files, want 1", ready, len(got))
 		}
@@ -415,7 +420,7 @@ func TestListMagnetsUsesOffset(t *testing.T) {
 		queries = append(queries, r.URL.Query())
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
-			{"id":"t3","userTorrentId":"ut3","infoHash":"h3","name":"c","totalSize":3,"status":"cached"}
+			{"id":"t3","userTorrentId":"ut3","infoHash":"h3","name":"c","totalSize":3,"status":"ready","addedAt":"2026-11-24T15:30:00Z"}
 		],"meta":{"offset":2,"limit":2,"hasMore":false,"total":7}}`))
 	})
 
@@ -434,6 +439,9 @@ func TestListMagnetsUsesOffset(t *testing.T) {
 	}
 	if len(data.Items) != 1 || data.Items[0].Id != "t3" {
 		t.Errorf("items = %+v, want just t3", data.Items)
+	}
+	if want := time.Date(2026, 11, 24, 15, 30, 0, 0, time.UTC); !data.Items[0].AddedAt.Equal(want) {
+		t.Errorf("addedAt = %v, want %v", data.Items[0].AddedAt, want)
 	}
 	// The exact total wins over anything derived from the page.
 	if data.TotalItems != 7 {
@@ -478,7 +486,7 @@ func TestListMagnetsFallsBackToTheTotalBound(t *testing.T) {
 				if i > 0 {
 					rows += ","
 				}
-				rows += `{"id":"t` + strconv.Itoa(i) + `","infoHash":"h","name":"n","totalSize":1,"status":"cached"}`
+				rows += `{"id":"t` + strconv.Itoa(i) + `","infoHash":"h","name":"n","totalSize":1,"status":"ready"}`
 			}
 			client, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -532,7 +540,7 @@ func TestItemEndpointsAddressTheTorrentId(t *testing.T) {
 	c, _ := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		got = append(got, r.URL.Query())
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"torrent":{"id":"t1","infoHash":"abc","name":"n","totalSize":1,"status":"cached"},"files":[]}}`))
+		_, _ = w.Write([]byte(`{"data":{"torrent":{"id":"t1","infoHash":"abc","name":"n","totalSize":1,"status":"ready"},"files":[]}}`))
 	})
 
 	if _, err := c.GetMagnet(&store.GetMagnetParams{Id: "t1"}); err != nil {

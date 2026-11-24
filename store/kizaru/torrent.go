@@ -28,6 +28,7 @@ type Torrent struct {
 	Status        string `json:"status"`
 	FileCount     int    `json:"fileCount"`
 	CreatedAt     string `json:"createdAt"`
+	AddedAt       string `json:"addedAt"`
 }
 
 // TorrentFile mirrors Kizaru's file record.
@@ -35,7 +36,7 @@ type Torrent struct {
 // There is deliberately NO s3Key field. Kizaru stopped publishing it — it is
 // the object layout of its bucket, not client state — and a filter on it is
 // what silently emptied every file list: the field never unmarshals, so every
-// file looks un-uploaded. Playability is a TORRENT-wide property (a `cached`
+// file looks un-uploaded. Playability is a TORRENT-wide property (a `ready`
 // torrent has every file uploaded), so it is read from the torrent status,
 // never inferred per file.
 type TorrentFile struct {
@@ -49,20 +50,21 @@ type TorrentDetailData struct {
 	Files   []TorrentFile `json:"files"`
 }
 
-// magnetStatus maps Kizaru's torrent lifecycle onto StremThru's magnet statuses.
-//
-// Kizaru: meta_pending | downloading | stalled | uploading | uploaded | seeding
-// | cached | error. Only the terminal-ready set maps to "cached", because Comet
-// treats anything else as "not cached yet" and refuses to build a stream.
+// magnetStatus maps Kizaru's public torrent phase onto StremThru's magnet
+// statuses. The customer-facing vocabulary is queued | downloading | preparing
+// | stalled | ready | failed; the older internal names are kept for a rolling
+// deploy where an engine still answers with the previous shape. Only the
+// terminal-ready set maps to "cached", because Comet treats anything else as
+// "not cached yet" and refuses to build a stream.
 func magnetStatus(kizaruStatus string) store.MagnetStatus {
 	switch kizaruStatus {
-	case "cached", "uploaded", "seeding":
+	case "ready", "cached", "uploaded", "seeding":
 		return store.MagnetStatusCached
 	case "downloading", "meta_pending", "stalled":
 		return store.MagnetStatusDownloading
-	case "uploading":
+	case "preparing", "uploading":
 		return store.MagnetStatusUploading
-	case "error":
+	case "failed", "error":
 		return store.MagnetStatusFailed
 	default:
 		return store.MagnetStatusQueued
@@ -298,7 +300,7 @@ func magnetFiles(torrentID string, files []CachedFile) []store.MagnetFile {
 
 // playableFiles returns the files a caller may mint a link for.
 //
-// Readiness is per TORRENT, never per file: Kizaru marks a torrent `cached`
+// Readiness is per TORRENT, never per file: Kizaru marks a torrent `ready`
 // only once every file in it has been uploaded, and a subset is not something
 // the API can transfer. The per-file s3Key this used to test is no longer
 // published, which made the old filter drop every file; the status is the
@@ -325,8 +327,10 @@ func playableFiles(torrentID, status string, files []TorrentFile) []store.Magnet
 }
 
 func torrentAddedAt(t Torrent) time.Time {
-	if ts, err := time.Parse(time.RFC3339, t.CreatedAt); err == nil {
-		return ts
+	for _, raw := range []string{t.AddedAt, t.CreatedAt} {
+		if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+			return ts
+		}
 	}
 	return time.Time{}
 }
